@@ -52,6 +52,7 @@ export class InputSystem {
     private gamepadLookDeadzone = 0.14;
     private gamepadLookSpeed = 0.55;
     private lastGamepadUpdateTime = performance.now();
+    private gamepadFrame: number | null = null;
 
     private boundKeydown = async (e: KeyboardEvent) => this.onKeydown(e); // 键盘按下绑定
     private boundKeyup = (e: KeyboardEvent) => this.onKeyup(e); // 键盘抬起绑定
@@ -60,6 +61,11 @@ export class InputSystem {
         if (e.target === this.ctrl.controls.domElement) this.ctrl.cam.setPointerLock(); // 鼠标点击绑定
     };
     private boundBlur = () => this.resetKeys(); // 页面失焦时重置按键状态
+    private gamepadLoop = () => {
+        this.updateGamepad();
+        if (this.ctrl.isupdate) this.gamepadFrame = window.requestAnimationFrame(this.gamepadLoop);
+        else this.gamepadFrame = null;
+    };
 
     private codeToAction = new Map<string, KeyAction>(); // 键码 -> 动作 反查表
 
@@ -220,6 +226,10 @@ export class InputSystem {
         window.addEventListener("mousemove", this.boundMouseMove);
         window.addEventListener("click", this.boundMouseClick);
         window.addEventListener("blur", this.boundBlur);
+        if (this.gamepadFrame == null && typeof window.requestAnimationFrame === "function") {
+            this.lastGamepadUpdateTime = performance.now();
+            this.gamepadFrame = window.requestAnimationFrame(this.gamepadLoop);
+        }
     }
 
     unbindEvents() {
@@ -230,6 +240,10 @@ export class InputSystem {
         window.removeEventListener("mousemove", this.boundMouseMove);
         window.removeEventListener("click", this.boundMouseClick);
         window.removeEventListener("blur", this.boundBlur);
+        if (this.gamepadFrame != null) {
+            window.cancelAnimationFrame(this.gamepadFrame);
+            this.gamepadFrame = null;
+        }
         this.resetKeys();
     }
 
