@@ -2,6 +2,13 @@
 
 Backbone and other browser-compatible standard gamepads are detected automatically after `player.init()` binds its input events. Connect the controller and press a button once so the browser exposes it to the page.
 
+## Quick preview test
+
+1. Open the deployed `glTF` demo on the phone with the Backbone connected.
+2. Tap the page once, then press any controller button so the browser exposes the gamepad.
+3. Confirm the left stick moves the character, the right stick rotates the camera, and A jumps.
+4. When testing a newly deployed preview, fully refresh the page first so the phone does not keep an older JavaScript bundle.
+
 ## On foot
 
 | Control | Action |
