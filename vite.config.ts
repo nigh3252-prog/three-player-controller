@@ -1,8 +1,12 @@
 import { resolve } from "path";
 import { defineConfig } from "vite";
 
+const isVercel = process.env.VERCEL === "1";
+
 export default defineConfig({
-    base: "/three-player-controller/",
+    // GitHub Pages hosts this project under /three-player-controller/.
+    // Vercel preview deployments are hosted at the domain root.
+    base: isVercel ? "/" : "/three-player-controller/",
     root: resolve(__dirname, "example"),
     server: { host: true },
     build: {
