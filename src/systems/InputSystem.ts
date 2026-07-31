@@ -14,6 +14,9 @@ const defaultKeyMap: Record<KeyAction, string[]> = {
     toggleVehicle: ["KeyE"],
 };
 
+type InputSource = "keyboard" | "program" | "gamepad";
+type StickState = { x: number; y: number; magnitude: number };
+
 export class InputSystem {
     private ctrl: playerController; // 主控制器引用
 
@@ -21,8 +24,8 @@ export class InputSystem {
     bkd = false; // 后退键
     lft = false; // 左移键
     rgt = false; // 右移键
-    space = false; // 跳跃键
-    shift = false; // 加速键
+    space = false; // 跳跃键 / 车辆刹车
+    shift = false; // 加速键 / 车辆漂移
 
     private keyFwd = false;
     private keyBkd = false;
@@ -30,6 +33,25 @@ export class InputSystem {
     private keyRgt = false;
     private analogMoveX = 0;
     private analogMoveY = 0;
+
+    // 持续动作按来源拆分，避免键盘、触控和手柄互相覆盖释放状态。
+    private keyboardJump = false;
+    private programJump = false;
+    private gamepadJump = false;
+    private keyboardSprint = false;
+    private programSprint = false;
+    private gamepadSprint = false;
+
+    // 标准 Gamepad API（Backbone / Xbox / PlayStation 等标准映射）。
+    private gamepadEnabled = true;
+    private gamepadIndex: number | null = null;
+    private gamepadMoveX = 0;
+    private gamepadMoveY = 0;
+    private gamepadButtons = new Map<number, boolean>();
+    private gamepadMoveDeadzone = 0.18;
+    private gamepadLookDeadzone = 0.14;
+    private gamepadLookSpeed = 0.55;
+    private lastGamepadUpdateTime = performance.now();
 
     private boundKeydown = async (e: KeyboardEvent) => this.onKeydown(e); // 键盘按下绑定
     private boundKeyup = (e: KeyboardEvent) => this.onKeyup(e); // 键盘抬起绑定
@@ -48,21 +70,21 @@ export class InputSystem {
 
     // 构建键码：动作 反查表：未传的动作用默认键，传 string/数组则覆盖，传 null 则禁用
     buildKeyMap(userMap?: KeyMap) {
-        this.codeToAction.clear();  // 清空旧表
+        this.codeToAction.clear();
         for (const action of Object.keys(defaultKeyMap) as KeyAction[]) {
             let codes: string[];
             if (userMap && action in userMap) {
                 const v = userMap[action];
-                if (v == null) continue; // null：禁用该动作
-                codes = Array.isArray(v) ? v : [v]; // 覆盖默认键
+                if (v == null) continue;
+                codes = Array.isArray(v) ? v : [v];
             } else {
-                codes = defaultKeyMap[action];  // 未传：用默认键
+                codes = defaultKeyMap[action];
             }
             for (const code of codes) this.codeToAction.set(code, action);
         }
     }
 
-    // 程序化输入接口
+    // 程序化输入接口（移动端控件和外部输入可复用）。
     setInput(input: Partial<{
         moveX: number; moveY: number;
         lookDeltaX: number; lookDeltaY: number;
@@ -71,7 +93,6 @@ export class InputSystem {
     }>) {
         const c = this.ctrl;
 
-        // 连续移动轴，供摇杆或手柄输入使用
         const prevFwd = this.fwd;
         const prevBkd = this.bkd;
         const prevLft = this.lft;
@@ -92,22 +113,105 @@ export class InputSystem {
             }
         }
 
-        // 视角朝向
         if (typeof input.lookDeltaX === "number" && typeof input.lookDeltaY === "number") {
             c.cam.setToward(input.lookDeltaX, input.lookDeltaY, 0.002);
         }
 
-        // 持续状态
-        if (typeof input.jump === "boolean") this.applyAction("jump", input.jump);
-        if (typeof input.shift === "boolean") this.applyAction("sprint", input.shift);
+        if (typeof input.jump === "boolean") this.applyAction("jump", input.jump, "program");
+        if (typeof input.shift === "boolean") this.applyAction("sprint", input.shift, "program");
 
-        // 触发式切换
-        if (input.toggleView) this.applyAction("toggleView", true);
-        if (input.toggleFly) this.applyAction("toggleFly", true);
-        if (input.toggleVehicle) this.applyAction("toggleVehicle", true);
+        if (input.toggleView) this.applyAction("toggleView", true, "program");
+        if (input.toggleFly) this.applyAction("toggleFly", true, "program");
+        if (input.toggleVehicle) this.applyAction("toggleVehicle", true, "program");
     }
 
-    // 绑定输入事件
+    /** 每帧轮询浏览器 Gamepad API。Backbone 在浏览器中使用 standard 映射。 */
+    updateGamepad(delta?: number) {
+        if (!this.gamepadEnabled || typeof navigator === "undefined" || typeof navigator.getGamepads !== "function") {
+            this.clearGamepadState();
+            return;
+        }
+
+        const now = performance.now();
+        const dt = delta ?? Math.min((now - this.lastGamepadUpdateTime) / 1000, 1 / 20);
+        this.lastGamepadUpdateTime = now;
+
+        let pads: (Gamepad | null)[];
+        try {
+            pads = Array.from(navigator.getGamepads());
+        } catch {
+            this.clearGamepadState();
+            return;
+        }
+
+        let pad = this.gamepadIndex == null ? null : pads[this.gamepadIndex];
+        if (!pad?.connected) pad = pads.find(p => p?.connected) ?? null;
+        if (!pad) {
+            this.clearGamepadState();
+            return;
+        }
+        this.gamepadIndex = pad.index;
+
+        const prevFwd = this.fwd;
+        const prevBkd = this.bkd;
+        const prevLft = this.lft;
+        const prevRgt = this.rgt;
+
+        let move = this.applyRadialDeadzone(pad.axes[0] ?? 0, -(pad.axes[1] ?? 0), this.gamepadMoveDeadzone);
+
+        // D-pad fallback for controllers/browsers that do not expose the left stick normally.
+        if (move.magnitude === 0) {
+            const dpadX = Number(this.buttonPressed(pad, 15)) - Number(this.buttonPressed(pad, 14));
+            const dpadY = Number(this.buttonPressed(pad, 12)) - Number(this.buttonPressed(pad, 13));
+            if (dpadX !== 0 || dpadY !== 0) {
+                const length = Math.hypot(dpadX, dpadY);
+                move = { x: dpadX / length, y: dpadY / length, magnitude: 1 };
+            }
+        }
+
+        // Driving uses the standard triggers when available: RT accelerate, LT reverse.
+        if (this.ctrl.controllerMode === 1) {
+            const throttle = this.buttonValue(pad, 7);
+            const reverse = this.buttonValue(pad, 6);
+            if (Math.max(throttle, reverse) > 0.05) move.y = Math.max(-1, Math.min(1, throttle - reverse));
+        }
+
+        this.gamepadMoveX = move.x;
+        this.gamepadMoveY = move.y;
+        this.syncDirectionFlags();
+        if (prevFwd !== this.fwd || prevBkd !== this.bkd || prevLft !== this.lft || prevRgt !== this.rgt) {
+            this.ctrl.animation.setAnimationByPressed();
+        }
+
+        const look = this.applyRadialDeadzone(pad.axes[2] ?? 0, pad.axes[3] ?? 0, this.gamepadLookDeadzone);
+        if (look.magnitude > 0) this.ctrl.cam.setToward(look.x, look.y, this.gamepadLookSpeed * Math.max(0, dt));
+
+        // Standard layout: A jump/brake, B fly, X vehicle, Y view, L3/RB sprint or drift.
+        this.applyAction("jump", this.buttonPressed(pad, 0), "gamepad");
+        this.applyAction("sprint", this.buttonPressed(pad, 10) || this.buttonPressed(pad, 5), "gamepad");
+        this.updateGamepadToggle(pad, 1, "toggleFly");
+        this.updateGamepadToggle(pad, 2, "toggleVehicle");
+        this.updateGamepadToggle(pad, 3, "toggleView");
+    }
+
+    setGamepadEnabled(enabled: boolean) {
+        this.gamepadEnabled = enabled;
+        if (!enabled) this.clearGamepadState();
+    }
+
+    setGamepadDeadzones(moveDeadzone: number, lookDeadzone = moveDeadzone) {
+        this.gamepadMoveDeadzone = Math.max(0, Math.min(0.95, moveDeadzone));
+        this.gamepadLookDeadzone = Math.max(0, Math.min(0.95, lookDeadzone));
+    }
+
+    setGamepadLookSpeed(speed: number) {
+        this.gamepadLookSpeed = Math.max(0, speed);
+    }
+
+    getGamepadIndex() {
+        return this.gamepadIndex;
+    }
+
     bindEvents() {
         this.ctrl.isupdate = true;
         this.ctrl.cam.setPointerLock();
@@ -118,7 +222,6 @@ export class InputSystem {
         window.addEventListener("blur", this.boundBlur);
     }
 
-    // 解绑输入事件
     unbindEvents() {
         this.ctrl.isupdate = false;
         document.exitPointerLock();
@@ -127,9 +230,9 @@ export class InputSystem {
         window.removeEventListener("mousemove", this.boundMouseMove);
         window.removeEventListener("click", this.boundMouseClick);
         window.removeEventListener("blur", this.boundBlur);
+        this.resetKeys();
     }
 
-    // 重置所有按键状态
     private resetKeys() {
         const c = this.ctrl;
         this.keyFwd = false;
@@ -138,65 +241,74 @@ export class InputSystem {
         this.keyRgt = false;
         this.analogMoveX = 0;
         this.analogMoveY = 0;
-        this.syncDirectionFlags();
+        this.gamepadMoveX = 0;
+        this.gamepadMoveY = 0;
+        this.keyboardJump = false;
+        this.programJump = false;
+        this.gamepadJump = false;
+        this.keyboardSprint = false;
+        this.programSprint = false;
+        this.gamepadSprint = false;
         this.space = false;
         this.shift = false;
+        this.gamepadButtons.clear();
+        this.syncDirectionFlags();
         c.controls.mouseButtons = { LEFT: 0, MIDDLE: 1, RIGHT: 2 };
         c.animation.setAnimationByPressed();
     }
 
-    // 统一动作派发
-    private applyAction(action: KeyAction, pressed: boolean) {
+    private applyAction(action: KeyAction, pressed: boolean, source: InputSource) {
         const c = this.ctrl;
         switch (action) {
-            // 前进
             case "forward": this.keyFwd = pressed; this.syncDirectionFlags(); c.animation.setAnimationByPressed(); break;
-            // 后退
             case "backward": this.keyBkd = pressed; this.syncDirectionFlags(); c.animation.setAnimationByPressed(); break;
-            // 左移
             case "left": this.keyLft = pressed; this.syncDirectionFlags(); c.animation.setAnimationByPressed(); break;
-            // 右移
             case "right": this.keyRgt = pressed; this.syncDirectionFlags(); c.animation.setAnimationByPressed(); break;
-            // 冲刺
-            case "sprint":
-                this.shift = pressed;
+            case "sprint": {
+                if (source === "keyboard") this.keyboardSprint = pressed;
+                else if (source === "program") this.programSprint = pressed;
+                else this.gamepadSprint = pressed;
+                const next = this.keyboardSprint || this.programSprint || this.gamepadSprint;
+                if (next === this.shift) break;
+                this.shift = next;
                 c.animation.setAnimationByPressed();
-                // 切换轨道拖拽键位
-                c.controls.mouseButtons = pressed
+                c.controls.mouseButtons = next
                     ? { LEFT: 2, MIDDLE: 1, RIGHT: 0 }
                     : { LEFT: 0, MIDDLE: 1, RIGHT: 2 };
                 break;
-            // 跳跃
-            case "jump":
-                if (pressed) {
-                    c.vehicle.cancelBoarding(); // 取消载具模式下的下车
-                    this.space = true;
-                    if (c.controllerMode === 1) return; // 载具模式不跳跃
-                    if (c.isFlying) { c.animation.setAnimationByPressed(); return; } // 飞行中仅切动画
-                    if (!c.playerIsOnGround) return; // 不在地面不能跳
-                    if (c.animation.isJumping()) return;  // 跳跃中不重复触发
+            }
+            case "jump": {
+                const wasPressed = this.space;
+                if (source === "keyboard") this.keyboardJump = pressed;
+                else if (source === "program") this.programJump = pressed;
+                else this.gamepadJump = pressed;
+                this.space = this.keyboardJump || this.programJump || this.gamepadJump;
+                if (this.space === wasPressed) break;
+                if (this.space) {
+                    c.vehicle.cancelBoarding();
+                    if (c.controllerMode === 1) break;
+                    if (c.isFlying) { c.animation.setAnimationByPressed(); break; }
+                    if (!c.playerIsOnGround) break;
+                    if (c.animation.isJumping()) break;
                     c.animation.startJump();
                     c.playerVelocity.y = c.jumpHeight;
-                    c.setOnGround(false); // 跳跃后设置为不在地面
-                } else {
-                    this.space = false;
-                    if (c.isFlying) c.animation.setAnimationByPressed();
+                    c.setOnGround(false);
+                } else if (c.isFlying) {
+                    c.animation.setAnimationByPressed();
                 }
                 break;
-            // 切换第一 / 第三人称视角
+            }
             case "toggleView":
                 if (pressed) c.cam.changeView();
                 break;
-            // 切换飞行模式
             case "toggleFly":
                 if (pressed && c.controllerMode === 0) {
                     c.isFlying = !c.isFlying;
                     if (c.isFlying) c.playerVelocity.set(0, 0, 0);
                     c.animation.setAnimationByPressed();
-                    if (!c.isFlying && !c.playerIsOnGround) c.animation.startJump(true); 
+                    if (!c.isFlying && !c.playerIsOnGround) c.animation.startJump(true);
                 }
                 break;
-            // 上 / 下车
             case "toggleVehicle":
                 if (pressed) {
                     if (c.isFlying) return;
@@ -206,39 +318,85 @@ export class InputSystem {
         }
     }
 
-    // 获取最终移动轴：模拟输入优先，否则使用键盘八方向
     getMoveAxes() {
-        const hasAnalogInput = this.analogMoveX !== 0 || this.analogMoveY !== 0;
-        if (hasAnalogInput) return { x: this.analogMoveX, y: this.analogMoveY, isAnalog: true };
-        return {
-            x: Number(this.keyRgt) - Number(this.keyLft),
-            y: Number(this.keyFwd) - Number(this.keyBkd),
-            isAnalog: false,
-        };
+        const analog = this.getActiveAnalogAxes();
+        if (analog.magnitude > 0) return { ...analog, isAnalog: true };
+        const x = Number(this.keyRgt) - Number(this.keyLft);
+        const y = Number(this.keyFwd) - Number(this.keyBkd);
+        return { x, y, magnitude: x !== 0 || y !== 0 ? 1 : 0, isAnalog: false };
     }
 
-    // 合并键盘与模拟输入，供动画和车辆等现有布尔逻辑使用
+    private getActiveAnalogAxes(): StickState {
+        const programMagnitude = Math.min(1, Math.hypot(this.analogMoveX, this.analogMoveY));
+        const gamepadMagnitude = Math.min(1, Math.hypot(this.gamepadMoveX, this.gamepadMoveY));
+        if (gamepadMagnitude >= programMagnitude) {
+            return { x: this.gamepadMoveX, y: this.gamepadMoveY, magnitude: gamepadMagnitude };
+        }
+        return { x: this.analogMoveX, y: this.analogMoveY, magnitude: programMagnitude };
+    }
+
     private syncDirectionFlags() {
         const threshold = 0.2;
-        this.fwd = this.keyFwd || this.analogMoveY > threshold;
-        this.bkd = this.keyBkd || this.analogMoveY < -threshold;
-        this.lft = this.keyLft || this.analogMoveX < -threshold;
-        this.rgt = this.keyRgt || this.analogMoveX > threshold;
+        const analog = this.getActiveAnalogAxes();
+        this.fwd = this.keyFwd || analog.y > threshold;
+        this.bkd = this.keyBkd || analog.y < -threshold;
+        this.lft = this.keyLft || analog.x < -threshold;
+        this.rgt = this.keyRgt || analog.x > threshold;
     }
 
-    // 键盘按下处理
+    private updateGamepadToggle(pad: Gamepad, buttonIndex: number, action: KeyAction) {
+        const pressed = this.buttonPressed(pad, buttonIndex);
+        const wasPressed = this.gamepadButtons.get(buttonIndex) ?? false;
+        if (pressed && !wasPressed) this.applyAction(action, true, "gamepad");
+        this.gamepadButtons.set(buttonIndex, pressed);
+    }
+
+    private buttonPressed(pad: Gamepad, index: number) {
+        const button = pad.buttons[index];
+        return !!button && (button.pressed || button.value > 0.5);
+    }
+
+    private buttonValue(pad: Gamepad, index: number) {
+        const button = pad.buttons[index];
+        return button ? Math.max(0, Math.min(1, button.value)) : 0;
+    }
+
+    private applyRadialDeadzone(x: number, y: number, deadzone: number): StickState {
+        const rawMagnitude = Math.min(1, Math.hypot(x, y));
+        if (rawMagnitude <= deadzone || rawMagnitude === 0) return { x: 0, y: 0, magnitude: 0 };
+        const magnitude = (rawMagnitude - deadzone) / (1 - deadzone);
+        const scale = magnitude / rawMagnitude;
+        return { x: x * scale, y: y * scale, magnitude };
+    }
+
+    private clearGamepadState() {
+        if (this.gamepadIndex == null && this.gamepadMoveX === 0 && this.gamepadMoveY === 0 && !this.gamepadJump && !this.gamepadSprint) return;
+        const prevFwd = this.fwd;
+        const prevBkd = this.bkd;
+        const prevLft = this.lft;
+        const prevRgt = this.rgt;
+        this.gamepadIndex = null;
+        this.gamepadMoveX = 0;
+        this.gamepadMoveY = 0;
+        this.gamepadButtons.clear();
+        this.applyAction("jump", false, "gamepad");
+        this.applyAction("sprint", false, "gamepad");
+        this.syncDirectionFlags();
+        if (prevFwd !== this.fwd || prevBkd !== this.bkd || prevLft !== this.lft || prevRgt !== this.rgt) {
+            this.ctrl.animation.setAnimationByPressed();
+        }
+    }
+
     private onKeydown(e: KeyboardEvent) {
         const action = this.codeToAction.get(e.code);
-        if (action) this.applyAction(action, true);
+        if (action) this.applyAction(action, true, "keyboard");
     }
 
-    // 键盘抬起处理
     private onKeyup(e: KeyboardEvent) {
         const action = this.codeToAction.get(e.code);
-        if (action) this.applyAction(action, false);
+        if (action) this.applyAction(action, false, "keyboard");
     }
 
-    // 鼠标移动处理
     private onMouseMove(e: MouseEvent) {
         if (document.pointerLockElement === document.body) {
             this.ctrl.cam.setToward(e.movementX, e.movementY, 0.0001);
