@@ -5,11 +5,6 @@ import { playerController as BasePlayerController } from "./playerController";
  * Backbone controllers use the standard gamepad mapping exposed by the browser.
  */
 export class playerController extends BasePlayerController {
-    override async update(delta?: number) {
-        this.input.updateGamepad(delta);
-        return super.update(delta);
-    }
-
     override updatePlayer(delta: number) {
         const move = this.input.getMoveAxes();
         const analogScale = move.isAnalog ? move.magnitude : 1;
