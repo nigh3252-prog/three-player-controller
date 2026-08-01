@@ -4,6 +4,21 @@ import { defineConfig } from "vite";
 const isVercel = process.env.VERCEL === "1";
 
 export default defineConfig({
+    plugins: [
+        {
+            name: "shooting-backbone-controls",
+            transformIndexHtml: {
+                order: "pre",
+                handler(html, context) {
+                    if (!context.filename.endsWith("shooting.html")) return html;
+                    return html.replace(
+                        "</body>",
+                        '    <script type="module" src="./backboneControls.js"></script>\n    </body>',
+                    );
+                },
+            },
+        },
+    ],
     // GitHub Pages hosts this project under /three-player-controller/.
     // Vercel preview deployments are hosted at the domain root.
     base: isVercel ? "/" : "/three-player-controller/",
